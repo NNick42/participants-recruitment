@@ -1,6 +1,6 @@
-# participants-recruitment-jp
+# participants-recruitment
 
-An easy way of recruiting participants.
+An easy way of recruiting participants. Forked from grocio/participants-recruitment-jp & snishiyama/participants-recruitment-jp
 
 - [Change Log](#change-log)
 - [導入](#導入)
