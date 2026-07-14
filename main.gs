@@ -16,7 +16,11 @@ function onOpening() {
     if (sheets.isConfigured) {
       mail.alertFewMails();
       if (TYPE == 3) {
-        SpreadsheetApp.getUi().createMenu('カレンダー').addItem('カレンダーをシートに反映', 'updateFormAndSchedule').addToUi();
+        SpreadsheetApp.getUi()
+          .createMenu('カレンダー')
+          .addItem('空き予定とフォームを更新', 'updateFormAndSchedule')
+          .addItem('旧形式を複数人共同募集形式へ移行', 'migrateType3MultiResourceSchema')
+          .addToUi();
       }
     }
   } catch (err) {
@@ -28,7 +32,10 @@ function onOpening() {
 }
 
 function onFormSubmission(e) {
+  const lock = LockService.getScriptLock();
+  let mailJob;
   try {
+    lock.waitLock(30000);
     // systemを利用しないなら以降の処理を行わない
     if (settings.config.useFormSystem != 1) {
       return;
@@ -38,9 +45,7 @@ function onFormSubmission(e) {
       booking.values = e.values;
       booking.setEventType(ScriptApp.EventType.ON_FORM_SUBMIT).validate().allocate(e.range.getRow());
       const { name, address, from: fromWhen, to: toWhen, trigger } = booking;
-      // mail
-      mail.create(name, trigger, fromWhen, toWhen).setBcc('', settings.config.selfBccTentative).send(address).alertFewMails();
-      updateFormAndSchedule();
+      mailJob = { name: name, address: address, from: fromWhen, to: toWhen, trigger: trigger };
       console.log('SUCCESS!');
     } else {
       console.log(e.values);
@@ -49,71 +54,180 @@ function onFormSubmission(e) {
     const msg = `[${err.name}] ${err.stack}`;
     console.error(msg);
     MailApp.sendEmail(settings.config.experimenterMailAddress, 'エラーが発生しました', msg);
+  } finally {
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
+  if (mailJob !== undefined) {
+    mail
+      .create(mailJob.name, mailJob.trigger, mailJob.from, mailJob.to)
+      .setBcc('', settings.config.selfBccTentative)
+      .send(mailJob.address)
+      .alertFewMails();
   }
 }
 
+function rangeTouchesHeaders(range, headers, names) {
+  const first = range.getColumn() - 1;
+  const last = range.getLastColumn() - 1;
+  return names.some((name) => {
+    const index = getHeaderIndex(headers, name);
+    return index >= first && index <= last;
+  });
+}
+
+function editedSettingKeys(range) {
+  const firstRow = Math.max(2, range.getRow());
+  const lastRow = range.getLastRow();
+  if (lastRow < firstRow) {
+    return [];
+  }
+  return range.getSheet().getRange(firstRow, 2, lastRow - firstRow + 1, 1).getValues().map((row) => String(row[0]));
+}
+
+function sendBookingMailJobs(jobs) {
+  jobs.forEach((job) => {
+    mail.create(job.name, job.trigger, job.from, job.to).setBcc(job.assistant, job.selfBcc).send(job.address).alertFewMails();
+    if (job.markMailed) {
+      sheets.sheets[0].getRange(job.row, settings.config.colMailed + 1).setValue(1);
+    }
+  });
+}
+
 function onSheetEdit(e) {
+  const sh = e.range.getSheet();
+  const sheetName = sh.getSheetName();
+  const answerSheetName = sheets.sheets[0].getSheetName();
+  const isAnswerStatusEdit =
+    sheetName === answerSheetName && e.range.getColumn() <= settings.config.colStatus + 1 && settings.config.colStatus + 1 <= e.range.getLastColumn();
+  let refreshType3 = false;
+  let collectSheet;
+  let oldConfig;
+
+  if (sheetName === '設定') {
+    oldConfig = copy(settings.config);
+    collectSheet = sheetName;
+    const availabilityKeys = new Set([
+      'numberOfRooms',
+      'openDate',
+      'closeDate',
+      'expTimeZone',
+      'colExpDate',
+      'colStatus',
+      'colAssistant',
+      'colRoom',
+      'colAssignmentStatus',
+      'colCalendarEventId',
+    ]);
+    refreshType3 = TYPE == 3 && editedSettingKeys(e.range).some((key) => availabilityKeys.has(key));
+  } else if (sheetName === 'メンバー') {
+    collectSheet = sheetName;
+    const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    refreshType3 = TYPE == 3 && (e.range.getRow() === 1 || rangeTouchesHeaders(e.range, headers, ['キー', 'カレンダーID', '有効']));
+  } else if (sheetName === 'テンプレート') {
+    collectSheet = sheetName;
+  } else if (sheetName === '空き予定' && TYPE == 3) {
+    const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    refreshType3 = e.range.getRow() === 1 || rangeTouchesHeaders(e.range, headers, ['日付', '開始', '終了', '担当候補', '受付可']);
+  }
+
+  if (collectSheet !== undefined) {
+    settings.collect(collectSheet, true).save();
+  }
+  const needsLegacySettingsUpdate = sheetName === '設定' && TYPE != 3;
+  if (!isAnswerStatusEdit && !refreshType3 && !needsLegacySettingsUpdate) {
+    return;
+  }
+
+  const lock = LockService.getScriptLock();
+  const mailJobs = [];
+  const ignoredEventIds = [];
   try {
-    const sh = e.range.getSheet();
-    const sheetName = sh.getSheetName();
+    lock.waitLock(30000);
     sheets.ss.toast('スクリプトを実行しています。終了までお待ちください。');
-    // 「フォームの回答」シートが編集された場合
-    if (sheetName === sheets.sheets[0].getSheetName()) {
-      const srow = e.range.getRow();
-      const erow = e.range.getLastRow();
-      const scol = e.range.getColumn();
-      // 予約ステータスの列を編集した場合
-      if (scol === settings.config.colStatus + 1) {
-        const answers = sh.getDataRange().getValues();
-        for (let row = srow; row <= erow; row++) {
-          // トリガーが削除された場合以降の処理をしない
-          if (answers[row - 1][settings.config.colStatus] == '') {
-            continue;
+    if (isAnswerStatusEdit) {
+      const answers = sh.getDataRange().getValues();
+      for (let row = e.range.getRow(); row <= e.range.getLastRow(); row++) {
+        if (answers[row - 1][settings.config.colStatus] == '') {
+          continue;
+        }
+        booking.values = answers[row - 1];
+        if (TYPE == 3) {
+          booking.setEventType(ScriptApp.EventType.ON_EDIT).validate().allocate(row);
+          if (booking.didRelease && booking.releasedEventId !== '') {
+            ignoredEventIds.push(booking.releasedEventId);
           }
-          booking.values = answers[row - 1];
-          // まだ予約に関するメールが送信されていない場合
-          if (booking.values[settings.config.colMailed] !== 1) {
-            booking.setEventType(ScriptApp.EventType.ON_EDIT).validate().allocate(row);
+          if (booking.shouldSendMail) {
             const { name, address, from: fromWhen, to: toWhen, trigger, assistant } = booking;
-            mail.create(name, trigger, fromWhen, toWhen).setBcc(assistant, settings.config.selfBccTentative).send(address).alertFewMails();
+            mailJobs.push({
+              row: row,
+              name: name,
+              address: address,
+              from: fromWhen,
+              to: toWhen,
+              trigger: trigger,
+              assistant: assistant,
+              selfBcc: booking.isFinalization ? settings.config.selfBccFinalize : settings.config.selfBccTentative,
+              markMailed: true,
+            });
           }
+        } else if (booking.values[settings.config.colMailed] !== 1) {
+          booking.setEventType(ScriptApp.EventType.ON_EDIT).validate().allocate(row);
+          const { name, address, from: fromWhen, to: toWhen, trigger, assistant } = booking;
+          mailJobs.push({
+            row: row,
+            name: name,
+            address: address,
+            from: fromWhen,
+            to: toWhen,
+            trigger: trigger,
+            assistant: assistant,
+            selfBcc: settings.config.selfBccTentative,
+            markMailed: false,
+          });
         }
       }
-    } else {
-      // 「フォームの回答」以外のシートが編集された場合
-      if (sheetName == '設定') {
-        oldConfig = copy(settings.config); // すぐあとの比較のために古い設定をコピー
-        settings.collect(sheetName, true).save(); // 更新・保存
-        if (settings.config.remindHour != oldConfig.remindHour) {
-          scriptTriggers.updateClockTrigger(settings.config.remindHour, settings.config.expTimeZone);
-        } else if (settings.config.expTimeZone != oldConfig.expTimeZone) {
-          sheets.ss.setSpreadsheetTimeZone(settings.config.expTimeZone);
-          scriptTriggers.updateClockTrigger(settings.config.remindHour, settings.config.expTimeZone);
-        } else if (settings.config.workingCalendar != oldConfig.workingCalendar) {
-          schedule.calendar = CalendarApp.getCalendarById(settings.config.workingCalendar);
-          // scriptTriggers.updateCalendarTrigger(settings.config.workingCalendar);
-          alertInitWithChangeOf('参照するカレンダー');
-        } else if (settings.config.experimentLength != oldConfig.experimentLength) {
-          alertInitWithChangeOf('実験の所要時間');
-        } else if (fmtDate(settings.config.openTime, 'HH:mm') != fmtDate(new Date(oldConfig.openTime), 'HH:mm')) {
-          alertInitWithChangeOf('実験の開始時刻');
-        } else if (fmtDate(settings.config.closeTime, 'HH:mm') != fmtDate(new Date(oldConfig.closeTime), 'HH:mm')) {
-          alertInitWithChangeOf('実験の終了時刻');
-        }
-      } else if (sheetName == 'メンバー' || sheetName == 'テンプレート') {
-        settings.collect(sheetName, true).save(); // 新しいキャッシュを作成
-      } else if (sheetName == '空き予定') {
-        updateFormAndSchedule();
+      if (TYPE == 3 && ignoredEventIds.length > 0) {
+        updateFormAndScheduleUnlocked({ ignoredEventIds: ignoredEventIds });
+      }
+    } else if (refreshType3) {
+      updateFormAndScheduleUnlocked();
+    }
+
+    if (sheetName === '設定' && TYPE == 3 && settings.config.expTimeZone != oldConfig.expTimeZone) {
+      sheets.ss.setSpreadsheetTimeZone(settings.config.expTimeZone);
+      scriptTriggers.updateClockTrigger(settings.config.remindHour, settings.config.expTimeZone);
+    }
+
+    if (sheetName === '設定' && TYPE != 3) {
+      if (settings.config.remindHour != oldConfig.remindHour) {
+        scriptTriggers.updateClockTrigger(settings.config.remindHour, settings.config.expTimeZone);
+      } else if (settings.config.expTimeZone != oldConfig.expTimeZone) {
+        sheets.ss.setSpreadsheetTimeZone(settings.config.expTimeZone);
+        scriptTriggers.updateClockTrigger(settings.config.remindHour, settings.config.expTimeZone);
+      } else if (settings.config.workingCalendar != oldConfig.workingCalendar) {
+        schedule.calendar = CalendarApp.getCalendarById(settings.config.workingCalendar);
+        alertInitWithChangeOf('参照するカレンダー');
+      } else if (settings.config.experimentLength != oldConfig.experimentLength) {
+        alertInitWithChangeOf('実験の所要時間');
+      } else if (fmtDate(settings.config.openTime, 'HH:mm') != fmtDate(new Date(oldConfig.openTime), 'HH:mm')) {
+        alertInitWithChangeOf('実験の開始時刻');
+      } else if (fmtDate(settings.config.closeTime, 'HH:mm') != fmtDate(new Date(oldConfig.closeTime), 'HH:mm')) {
+        alertInitWithChangeOf('実験の終了時刻');
       }
     }
     sheets.ss.toast('スクリプトが終了しました。', '', 3);
   } catch (err) {
-    //実行に失敗した時に通知
     const msg = `[${err.name}] ${err.stack}`;
     console.error(msg);
     dlg.alert('エラーが発生しました', msg, dlg.ui.ButtonSet.OK);
-    // Browser.msgBox('エラーが発生しました', msg, Browser.Buttons.OK);
+  } finally {
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
   }
+  sendBookingMailJobs(mailJobs);
 }
 
 function onClock() {
@@ -152,7 +266,17 @@ function onClock() {
 
     // フォームの修正
     if (settings.config.useFormSystem == 1) {
-      form.modify();
+      const lock = LockService.getScriptLock();
+      lock.waitLock(30000);
+      try {
+        if (TYPE == 3) {
+          updateFormAndScheduleUnlocked();
+        } else {
+          form.modify();
+        }
+      } finally {
+        lock.releaseLock();
+      }
     }
   } catch (err) {
     //実行に失敗した時に通知
@@ -235,6 +359,54 @@ function copy(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
 
+function getHeaderIndex(headers, name) {
+  return headers.indexOf(name);
+}
+
+function parseKeys(value) {
+  const matches = String(zenToHan(value || '')).match(/\d+/g);
+  return matches === null ? [] : matches;
+}
+
+function isEnabled(value) {
+  return String(zenToHan(value)).trim() === '1';
+}
+
+function dateFromSlotParts(dateValue, timeValue) {
+  const date = new Date(dateValue);
+  if (is(timeValue, 'Date')) {
+    date.setHours(timeValue.getHours(), timeValue.getMinutes(), 0, 0);
+    return date.toString() == 'Invalid Date' ? undefined : date;
+  }
+  const time = String(zenToHan(timeValue || '')).match(/\d+/g);
+  if (date.toString() == 'Invalid Date' || time === null || time.length < 2) {
+    return undefined;
+  }
+  date.setHours(Number(time[0]), Number(time[1]), 0, 0);
+  return date;
+}
+
+function parseType3Slot(value) {
+  const numbers = String(zenToHan(value || '')).match(/\d+/g);
+  if (numbers === null || numbers.length !== 7) {
+    return undefined;
+  }
+  const from = new Date();
+  from.setFullYear(Number(numbers[0]), Number(numbers[1]) - 1, Number(numbers[2]));
+  from.setHours(Number(numbers[3]), Number(numbers[4]), 0, 0);
+  const to = new Date(from);
+  to.setHours(Number(numbers[5]), Number(numbers[6]), 0, 0);
+  return { from: from, to: to };
+}
+
+function type3SlotLabel(from, to) {
+  return `${fmtDate(from, 'yyyy/MM/dd HH:mm')}-${fmtDate(to, 'HH:mm')}`;
+}
+
+function intervalsOverlap(fromA, toA, fromB, toB) {
+  return fromA < toB && fromB < toA;
+}
+
 // https://qiita.com/jz4o/items/d4e978f9085129155ca6 を改変
 function isHoliday(time) {
   //土日か判定
@@ -273,8 +445,40 @@ function updateFormAndSchedule() {
   if (TYPE != 3) {
     return;
   }
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    updateFormAndScheduleUnlocked();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function updateFormAndScheduleUnlocked(options) {
+  if (TYPE == 3) {
+    const snapshot = multiSchedule.buildSnapshot(options);
+    multiSchedule.applySnapshot(snapshot);
+    return;
+  }
   schedule.update().allocate(); // スケジュールを更新してシートに反映する
   form.modify();
+}
+
+function migrateType3MultiResourceSchema() {
+  if (TYPE != 3) {
+    throw new Error('複数実験者・実験室の移行は TYPE = 3 でのみ実行できます。');
+  }
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    settings.collect('設定', true);
+    multiSchedule.assertMigrationIsSafe();
+    settings.ensureType3Schema();
+    multiSchedule.migrateLegacySlots();
+    updateFormAndScheduleUnlocked();
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -390,10 +594,70 @@ const settings = (function () {
   function __getMembers(update) {
     const table = sheets.getValuesOf('メンバー', update);
     __settings.members = {};
+    __settings.memberDetails = {};
+    const headers = table[0] || [];
+    const keyCol = getHeaderIndex(headers, 'キー');
+    const nameCol = getHeaderIndex(headers, '名前');
+    const addressCol = getHeaderIndex(headers, 'アドレス');
+    const calendarCol = getHeaderIndex(headers, 'カレンダーID');
+    const enabledCol = getHeaderIndex(headers, '有効');
     for (let row = 1; row < table.length; row++) {
-      let key = zenToHan(table[row][0]);
-      let address = zenToHan(table[row][2]);
+      let key = zenToHan(table[row][keyCol]);
+      let address = zenToHan(table[row][addressCol]);
+      if (String(key).trim() === '') {
+        continue;
+      }
       __settings.members[key] = address;
+      __settings.memberDetails[key] = {
+        key: String(key),
+        name: nameCol >= 0 ? table[row][nameCol] : '',
+        address: address,
+        calendarId: calendarCol >= 0 ? String(zenToHan(table[row][calendarCol] || '')).trim() : '',
+        enabled: enabledCol >= 0 && isEnabled(table[row][enabledCol]),
+      };
+    }
+  }
+
+  function __appendAnswerColumns() {
+    const sh = sheets.sheets[0];
+    const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    const additions = ['実験室', '割当状態', 'CalendarEventId'];
+    const missing = additions.filter((header) => !headers.includes(header));
+    if (missing.length > 0) {
+      sh.getRange(1, headers.length + 1, 1, missing.length).setValues([missing]);
+    }
+  }
+
+  function __appendConfigRows() {
+    const sh = sheets.getSheetByName('設定');
+    const table = sh.getDataRange().getValues();
+    const existingRows = new Map();
+    table.slice(1).forEach((row, index) => existingRows.set(row[1], index + 2));
+    const answerHeaders = sheets.sheets[0].getRange(1, 1, 1, sheets.sheets[0].getLastColumn()).getValues()[0];
+    const required = [
+      ['実験室数 (1-5)', 'numberOfRooms', 1],
+      ['実験室の列', 'colRoom', numToColumnNotation(getHeaderIndex(answerHeaders, '実験室'))],
+      ['割当状態の列', 'colAssignmentStatus', numToColumnNotation(getHeaderIndex(answerHeaders, '割当状態'))],
+      ['CalendarEventId の列', 'colCalendarEventId', numToColumnNotation(getHeaderIndex(answerHeaders, 'CalendarEventId'))],
+    ];
+    const missing = required.filter((row) => !existingRows.has(row[1]));
+    if (missing.length > 0) {
+      sh.getRange(sh.getLastRow() + 1, 1, missing.length, 3).setValues(missing);
+    }
+    required.slice(1).forEach((row) => {
+      const existingRow = existingRows.get(row[1]);
+      if (existingRow !== undefined) {
+        sh.getRange(existingRow, 3).setValue(row[2]);
+      }
+    });
+  }
+
+  function __appendMemberColumns() {
+    const sh = sheets.getSheetByName('メンバー');
+    const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    const additions = ['カレンダーID', '有効'].filter((header) => !headers.includes(header));
+    if (additions.length > 0) {
+      sh.getRange(1, headers.length + 1, 1, additions.length).setValues([additions]);
     }
   }
 
@@ -494,6 +758,22 @@ const settings = (function () {
       }
       return __settings.members;
     },
+    get activeMembers() {
+      if (__settings.memberDetails === undefined) {
+        this.collect('メンバー', true);
+      }
+      const members = Object.values(__settings.memberDetails).filter((member) => member.enabled && member.calendarId.length > 0);
+      if (members.length > 5) {
+        throw new Error('有効な実験者は最大5名です。「メンバー」シートの「有効」を見直してください。');
+      }
+      return members;
+    },
+    memberByKey: function (key) {
+      if (__settings.memberDetails === undefined) {
+        this.collect('メンバー', true);
+      }
+      return __settings.memberDetails[String(key)];
+    },
 
     collect: function (sheetName, update = false) {
       __collect(sheetName, update);
@@ -508,6 +788,19 @@ const settings = (function () {
     save: function () {
       const sh = sheets.getSheetByName('Cached');
       sh.getRange(1, 1).setValue(JSON.stringify(__settings));
+    },
+
+    ensureType3Schema: function () {
+      if (TYPE != 3) {
+        return this;
+      }
+      __appendAnswerColumns();
+      __appendConfigRows();
+      __appendMemberColumns();
+      sheets.getValuesOf('設定', true);
+      sheets.getValuesOf('メンバー', true);
+      this.collect('設定', true).collect('メンバー', true).save();
+      return this;
     },
 
     isDefault: function () {
@@ -658,7 +951,7 @@ const form = (function () {
     item.setChoices(choices);
   }
 
-  function __modifyType3() {
+  function __modifyType3(snapshot) {
     if (__form === undefined) {
       __form = FormApp.openByUrl(sheets.ss.getFormUrl());
     }
@@ -673,24 +966,21 @@ const form = (function () {
       return;
     }
 
-    const choices = [];
-    for (const exp_dates of schedule.available.values()) {
-      for (let idx = 0; idx < exp_dates.length; idx++) {
-        const exp_date = exp_dates[idx];
-        if (is(exp_date, 'Date') && settings.config.openDate <= exp_date && exp_date < settings.config.closeDate) {
-          const stime = fmtDate(new Date(exp_date), 'yyyy/MM/dd HH:mm');
-          let etime = new Date(stime);
-          etime.setMinutes(etime.getMinutes() + settings.config.experimentLength);
-          etime = fmtDate(etime, 'HH:mm');
-          choices.push(item.createChoice(`${stime}-${etime}`));
-        }
-      }
+    if (snapshot === undefined) {
+      throw new Error('TYPE 3 のフォーム更新には availability snapshot が必要です。');
     }
+    const labels = snapshot.choices;
+    if (labels.length === 0) {
+      __form.setAcceptingResponses(false);
+      return;
+    }
+    __form.setAcceptingResponses(true);
+    const choices = labels.map((label) => item.createChoice(label));
     item.setChoices(choices);
   }
 
   return {
-    modify: function () {
+    modify: function (snapshot) {
       // 実験実施期間を過ぎていたらフォームを閉じる
       if (settings.config.outOfDate) {
         if (__form === undefined) {
@@ -703,7 +993,7 @@ const form = (function () {
         case 2:
           return __modifyType2();
         case 3:
-          return __modifyType3();
+          return __modifyType3(snapshot);
         default:
           return;
       }
@@ -724,6 +1014,12 @@ const booking = (function () {
   let __event_type;
   let __calendar;
   let __finalizeTriggers;
+  let __type3Allocation;
+  let __isFinalization = false;
+  let __isNoop = false;
+  let __shouldSendMail = false;
+  let __didRelease = false;
+  let __releasedEventId = '';
   if (sheets.isConfigured) {
     __calendar = CalendarApp.getCalendarById(settings.config.workingCalendar);
     __finalizeTriggers = String(settings.config.finalizeTrigger).match(/\d+/g);
@@ -741,6 +1037,18 @@ const booking = (function () {
   }
 
   function __validateSubmission() {
+    __isFinalization = false;
+    __isNoop = false;
+    __shouldSendMail = false;
+    __didRelease = false;
+    __releasedEventId = '';
+    if (TYPE == 3) {
+      __type3Allocation = multiSchedule.prepareTentative(__values);
+      __trigger = __type3Allocation.trigger;
+      __valid = __type3Allocation.valid;
+      __status = __valid ? ['', '', '', ''] : [__trigger, 1, 'N/A', 'N/A'];
+      return;
+    }
     if (__from === undefined || __to === undefined) {
       return undefined;
     }
@@ -762,6 +1070,51 @@ const booking = (function () {
   function __validateEdit() {
     __trigger = String(__values[settings.config.colStatus]);
     const validTriggers = Object.keys(settings.templates);
+    __isFinalization = false;
+    __isNoop = false;
+    __shouldSendMail = false;
+    __didRelease = false;
+    __releasedEventId = '';
+
+    if (TYPE == 3) {
+      const assignmentState = String(__values[settings.config.colAssignmentStatus]);
+      const hasMailed = __values[settings.config.colMailed] === 1;
+      if (__finalizeTriggers.includes(__trigger)) {
+        if (assignmentState === '確定') {
+          __isNoop = true;
+          __isFinalization = true;
+          __shouldSendMail = !hasMailed;
+          return;
+        }
+        if (assignmentState !== '仮割当') {
+          throw new Error('111 で最終確認できるのは「仮割当」の予約だけです。新しい pair の再割当は行いません。');
+        }
+        const remindDate = new Date(__from);
+        remindDate.setDate(__from.getDate() - 1);
+        const today = new Date();
+        today.setHours(19);
+        __status = [1, remindDate, remindDate <= today ? '直前のため省略' : '送信準備'];
+        __valid = true;
+        __isFinalization = true;
+        __shouldSendMail = !hasMailed;
+        return;
+      }
+      if (!validTriggers.includes(__trigger)) {
+        throw new Error('予約ステータスに入力された文字列（トリガー）が「テンプレート」に存在しないため，メールの送信等の処理は行われませんでした。');
+      }
+      if (assignmentState === '解放') {
+        __isNoop = true;
+        __shouldSendMail = !hasMailed;
+        return;
+      }
+      if (assignmentState !== '仮割当' && assignmentState !== '確定') {
+        throw new Error('222/333 などで解放できるのは「仮割当」または「確定」の予約だけです。');
+      }
+      __status = [1, 'N/A', 'N/A'];
+      __valid = false;
+      __shouldSendMail = true;
+      return;
+    }
 
     if (__finalizeTriggers.includes(__trigger)) {
       // 予約確定のトリガーなら
@@ -787,6 +1140,10 @@ const booking = (function () {
   }
 
   function __allocateOnSubmission(numRow) {
+    if (TYPE == 3) {
+      multiSchedule.commitTentative(numRow, __values, __type3Allocation);
+      return;
+    }
     sheets.sheets[0].getRange(numRow, settings.config.colStatus + 1, 1, __status.length).setValues([__status]);
     // カレンダーの編集
     if (__valid) {
@@ -796,6 +1153,21 @@ const booking = (function () {
   }
 
   function __allocateOnEdit(numRow) {
+    if (TYPE == 3) {
+      if (__isNoop) {
+        return;
+      }
+      if (__isFinalization) {
+        multiSchedule.finalize(numRow, __values);
+      } else {
+        __releasedEventId = multiSchedule.release(numRow, __values);
+        __didRelease = true;
+      }
+      if (!__isNoop) {
+        sheets.sheets[0].getRange(numRow, settings.config.colRemindDate + 1, 1, 2).setValues([[__status[1], __status[2]]]);
+      }
+      return;
+    }
     sheets.sheets[0].getRange(numRow, settings.config.colMailed + 1, 1, __status.length).setValues([__status]);
     // カレンダーの編集
     // まず予約イベントを削除する
@@ -929,7 +1301,14 @@ const booking = (function () {
       } else if (TYPE == 2) {
         __fmtExpDateTimeType2();
       } else if (TYPE == 3) {
-        __fmtExpDateTimeType3();
+        const slot = parseType3Slot(__values[settings.config.colExpDate]);
+        if (slot === undefined) {
+          __from = undefined;
+          __to = undefined;
+        } else {
+          __from = slot.from;
+          __to = slot.to;
+        }
       }
       if (__from !== undefined) {
         __from.setSeconds(0, 0);
@@ -947,6 +1326,21 @@ const booking = (function () {
     },
     get assistant() {
       return __values[settings.config.colAssistant];
+    },
+    get room() {
+      return TYPE == 3 ? __values[settings.config.colRoom] : undefined;
+    },
+    get isFinalization() {
+      return __isFinalization;
+    },
+    get shouldSendMail() {
+      return __shouldSendMail;
+    },
+    get didRelease() {
+      return __didRelease;
+    },
+    get releasedEventId() {
+      return __releasedEventId;
     },
 
     setEventType: function (eventType) {
@@ -973,6 +1367,11 @@ const booking = (function () {
         __allocateOnTime(numRow);
       }
 
+      return this;
+    },
+
+    markMailed: function (numRow) {
+      sheets.sheets[0].getRange(numRow, settings.config.colMailed + 1).setValue(1);
       return this;
     },
   };
@@ -1091,6 +1490,9 @@ const schedule = (function () {
 
   return {
     get available() {
+      if (TYPE == 3) {
+        return multiSchedule.slots();
+      }
       if (__available === undefined) {
         __getAvailable(sheets.getValuesOf('空き予定', true));
       }
@@ -1102,11 +1504,18 @@ const schedule = (function () {
     },
 
     update: function () {
+      if (TYPE == 3) {
+        multiSchedule.applySnapshot(multiSchedule.buildSnapshot());
+        return this;
+      }
       __getAvailable(sheets.getValuesOf('空き予定', true));
       return this;
     },
 
     allocate: function () {
+      if (TYPE == 3) {
+        return this;
+      }
       const table = [];
       for (let [exp_date, exp_times] of __available.entries()) {
         let new_row = exp_times.map((exp_time) => {
@@ -1123,6 +1532,9 @@ const schedule = (function () {
     },
 
     init: function () {
+      if (TYPE == 3) {
+        throw new Error('TYPE 3 の空き予定初期化は新形式では行いません。必要な slot を「空き予定」シートに追加してください。');
+      }
       const available_array = [];
       for (let now = new Date(settings.config.openDate); now <= settings.config.closeDate; now.setDate(now.getDate() + 1)) {
         const new_row = [];
@@ -1138,6 +1550,433 @@ const schedule = (function () {
       __getAvailable(available_array);
       sheets.getSheetByName('空き予定').clearContents();
       this.allocate();
+    },
+  };
+})();
+
+// TYPE 3 の複数実験者・複数実験室スケジューリングを扱うオブジェクト
+const multiSchedule = (function () {
+  const ACTIVE_STATES = new Set(['仮割当', '確定']);
+
+  function __rooms() {
+    const count = Number(settings.config.numberOfRooms);
+    if (!Number.isInteger(count) || count < 1 || count > 5) {
+      throw new Error('設定シートの「実験室数 (1-5)」には 1 から 5 の整数を入力してください。');
+    }
+    return Array.from({ length: count }, (_, index) => `Room ${index + 1}`);
+  }
+
+  function __backupName() {
+    const base = '空き予定_旧形式_backup';
+    let name = base;
+    let index = 2;
+    while (sheets.ss.getSheetByName(name) !== null) {
+      name = `${base}_${index}`;
+      index += 1;
+    }
+    return name;
+  }
+
+  function __migrateLegacySlots() {
+    const sh = sheets.getSheetByName('空き予定');
+    const legacy = sh.getDataRange().getValues();
+    if (legacy.length === 0 || legacy[0].includes('日付')) {
+      return;
+    }
+    const converted = [['日付', '開始', '終了', '担当候補', '受付可', '空き実験者（参考）', '空き実験室数', '残り枠', '割当済み']];
+    legacy.forEach((row) => {
+      const date = new Date(row[0]);
+      if (date.toString() == 'Invalid Date') {
+        return;
+      }
+      row.slice(1).forEach((time) => {
+        const from = dateFromSlotParts(date, time);
+        if (from === undefined) {
+          return;
+        }
+        const to = new Date(from);
+        to.setMinutes(to.getMinutes() + Number(settings.config.experimentLength));
+        converted.push([fmtDate(from, 'yyyy/MM/dd'), fmtDate(from, 'HH:mm'), fmtDate(to, 'HH:mm'), '', 1, '', '', '', '']);
+      });
+    });
+    sh.copyTo(sheets.ss).setName(__backupName());
+    sh.clearContents();
+    sh.getRange(1, 1, converted.length, converted[0].length).setValues(converted);
+    sheets.update();
+  }
+
+  function __isLegacySchedule() {
+    const table = sheets.getSheetByName('空き予定').getDataRange().getValues();
+    return table.length > 0 && !(table[0] || []).includes('日付');
+  }
+
+  function __assertSchema() {
+    const answerHeaders = sheets.sheets[0].getRange(1, 1, 1, sheets.sheets[0].getLastColumn()).getValues()[0];
+    const requiredAnswers = ['実験室', '割当状態', 'CalendarEventId'];
+    if (requiredAnswers.some((header) => !answerHeaders.includes(header)) || __isLegacySchedule()) {
+      throw new Error('TYPE 3 の複数人共同募集を開始する前に、管理者が migrateType3MultiResourceSchema を一度実行してください。');
+    }
+  }
+
+  function __assertMigrationIsSafe() {
+    if (!__isLegacySchedule()) {
+      return;
+    }
+    const values = sheets.sheets[0].getDataRange().getValues();
+    const futureRows = values.slice(1).filter((row) => {
+      const slot = parseType3Slot(row[settings.config.colExpDate]);
+      return slot !== undefined && slot.from > new Date();
+    });
+    if (futureRows.length > 0) {
+      throw new Error('将来の旧 TYPE 3 予約があるため自動移行を中止しました。既存予約を完了または別途処理してから移行してください。');
+    }
+  }
+
+  function __ensureAvailabilityColumns() {
+    const sh = sheets.getSheetByName('空き予定');
+    const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    if (!headers.includes('日付')) {
+      return;
+    }
+    const additions = ['空き実験者（参考）', '空き実験室数'].filter((header) => !headers.includes(header));
+    if (additions.length > 0) {
+      sh.getRange(1, headers.length + 1, 1, additions.length).setValues([additions]);
+    }
+  }
+
+  function __getSlots() {
+    __assertSchema();
+    __ensureAvailabilityColumns();
+    const table = sheets.getValuesOf('空き予定', true);
+    const headers = table[0] || [];
+    const dateCol = getHeaderIndex(headers, '日付');
+    const startCol = getHeaderIndex(headers, '開始');
+    const endCol = getHeaderIndex(headers, '終了');
+    const candidateCol = getHeaderIndex(headers, '担当候補');
+    const acceptingCol = getHeaderIndex(headers, '受付可');
+    const availableMembersCol = getHeaderIndex(headers, '空き実験者（参考）');
+    const availableRoomsCol = getHeaderIndex(headers, '空き実験室数');
+    const remainingCol = getHeaderIndex(headers, '残り枠');
+    const allocatedCol = getHeaderIndex(headers, '割当済み');
+    if ([dateCol, startCol, endCol, candidateCol, acceptingCol, availableMembersCol, availableRoomsCol, remainingCol, allocatedCol].some((index) => index < 0)) {
+      throw new Error('「空き予定」は 日付、開始、終了、担当候補、受付可、空き実験者（参考）、空き実験室数、残り枠、割当済み の列を持つ必要があります。');
+    }
+    const slots = [];
+    const labels = new Set();
+    for (let row = 1; row < table.length; row++) {
+      const from = dateFromSlotParts(table[row][dateCol], table[row][startCol]);
+      const to = dateFromSlotParts(table[row][dateCol], table[row][endCol]);
+      if (from === undefined || to === undefined || to <= from) {
+        continue;
+      }
+      const label = type3SlotLabel(from, to);
+      if (labels.has(label)) {
+        throw new Error(`「空き予定」に重複した slot ${label} があります。同じ日時は1行だけにしてください。`);
+      }
+      labels.add(label);
+      slots.push({
+        row: row + 1,
+        from: from,
+        to: to,
+        label: label,
+        candidateKeys: parseKeys(table[row][candidateCol]),
+        accepting: isEnabled(table[row][acceptingCol]),
+        remainingCol: remainingCol,
+        allocatedCol: allocatedCol,
+      });
+    }
+    return {
+      table: table,
+      slots: slots,
+      availableMembersCol: availableMembersCol,
+      availableRoomsCol: availableRoomsCol,
+      remainingCol: remainingCol,
+      allocatedCol: allocatedCol,
+    };
+  }
+
+  function __activeBookings() {
+    const table = sheets.sheets[0].getDataRange().getValues();
+    const bookings = [];
+    for (let row = 1; row < table.length; row++) {
+      if (!ACTIVE_STATES.has(String(table[row][settings.config.colAssignmentStatus]))) {
+        continue;
+      }
+      const slot = parseType3Slot(table[row][settings.config.colExpDate]);
+      const assistant = String(zenToHan(table[row][settings.config.colAssistant] || '')).trim();
+      const room = String(table[row][settings.config.colRoom] || '').trim();
+      if (slot !== undefined && assistant !== '' && room !== '') {
+        bookings.push({
+          row: row + 1,
+          from: slot.from,
+          to: slot.to,
+          assistant: assistant,
+          room: room,
+          eventId: String(table[row][settings.config.colCalendarEventId] || ''),
+        });
+      }
+    }
+    return bookings;
+  }
+
+  function __calendarFor(member) {
+    const calendar = CalendarApp.getCalendarById(member.calendarId);
+    if (calendar === null) {
+      throw new Error(`メンバー ${member.key} のカレンダーIDにアクセスできません。共有設定とIDを確認してください。`);
+    }
+    return calendar;
+  }
+
+  function __isBlockingEvent(event, ignoredEventIds) {
+    if (ignoredEventIds.has(String(event.getId()))) {
+      return false;
+    }
+    if (typeof event.getTransparency === 'function' && event.getTransparency() === CalendarApp.EventTransparency.TRANSPARENT) {
+      return false;
+    }
+    return true;
+  }
+
+  function __loadAvailabilityContext(options) {
+    options = options || {};
+    const slotData = __getSlots();
+    const members = settings.activeMembers;
+    const rooms = __rooms();
+    const activeBookings = __activeBookings().filter((item) => item.row !== options.excludedRow);
+    const assignmentsByMember = activeBookings.reduce((counts, item) => {
+      counts[item.assistant] = (counts[item.assistant] || 0) + 1;
+      return counts;
+    }, {});
+    const ignoredEventIds = new Set((options.ignoredEventIds || []).map(String));
+    const eventsByMember = {};
+    if (slotData.slots.length > 0) {
+      const rangeStart = new Date(Math.min.apply(null, slotData.slots.map((slot) => slot.from.getTime())));
+      const rangeEnd = new Date(Math.max.apply(null, slotData.slots.map((slot) => slot.to.getTime())));
+      members.forEach((member) => {
+        eventsByMember[member.key] = __calendarFor(member)
+          .getEvents(rangeStart, rangeEnd)
+          .filter((event) => __isBlockingEvent(event, ignoredEventIds))
+          .map((event) => ({ from: event.getStartTime(), to: event.getEndTime(), eventId: String(event.getId()) }));
+      });
+    }
+    return {
+      slotData: slotData,
+      members: members,
+      rooms: rooms,
+      activeBookings: activeBookings,
+      assignmentsByMember: assignmentsByMember,
+      eventsByMember: eventsByMember,
+    };
+  }
+
+  function __calculateAvailabilitySnapshot(context) {
+    const states = context.slotData.slots.map((slot) => {
+      const overlappingBookings = context.activeBookings.filter((item) => intervalsOverlap(slot.from, slot.to, item.from, item.to));
+      const candidates = context.members.filter((member) => slot.candidateKeys.length === 0 || slot.candidateKeys.includes(member.key));
+      const availableMembers = candidates.filter((member) => {
+        if (overlappingBookings.some((item) => item.assistant === member.key)) {
+          return false;
+        }
+        return !(context.eventsByMember[member.key] || []).some((event) => intervalsOverlap(slot.from, slot.to, event.from, event.to));
+      });
+      const availableRooms = context.rooms.filter((room) => !overlappingBookings.some((item) => item.room === room));
+      availableMembers.sort((a, b) => {
+        const difference = (context.assignmentsByMember[a.key] || 0) - (context.assignmentsByMember[b.key] || 0);
+        if (difference !== 0) {
+          return difference;
+        }
+        return String(a.key).localeCompare(String(b.key), undefined, { numeric: true });
+      });
+      return {
+        slot: slot,
+        bookings: overlappingBookings,
+        members: availableMembers,
+        rooms: availableRooms,
+        remaining: Math.min(availableMembers.length, availableRooms.length),
+        allocated: overlappingBookings.length,
+      };
+    });
+    return {
+      context: context,
+      states: states,
+      choices: states
+        .filter((state) => state.slot.accepting && state.remaining > 0)
+        .filter((state) => settings.config.openDate <= state.slot.from && state.slot.from <= settings.config.closeDate)
+        .map((state) => state.slot.label),
+    };
+  }
+
+  function __applyMemberAssignmentCounts(context) {
+    const sh = sheets.getSheetByName('メンバー');
+    const table = sh.getDataRange().getValues();
+    const headers = table[0] || [];
+    const keyCol = getHeaderIndex(headers, 'キー');
+    const countCol = getHeaderIndex(headers, '担当回数');
+    if (keyCol < 0 || countCol < 0) {
+      throw new Error('「メンバー」は キー と 担当回数 の列を持つ必要があります。');
+    }
+    if (table.length < 2) {
+      return;
+    }
+    const counts = table.slice(1).map((row) => {
+      const key = String(zenToHan(row[keyCol] || '')).trim();
+      return [key === '' ? '' : context.assignmentsByMember[key] || 0];
+    });
+    sh.getRange(2, countCol + 1, counts.length, 1).setValues(counts);
+  }
+
+  function __applyAvailabilitySnapshot(snapshot) {
+    const slotData = snapshot.context.slotData;
+    if (slotData.table.length > 1) {
+      const resultColumns = [slotData.availableMembersCol, slotData.availableRoomsCol, slotData.remainingCol, slotData.allocatedCol];
+      const firstResultCol = Math.min.apply(null, resultColumns);
+      const lastResultCol = Math.max.apply(null, resultColumns);
+      const results = slotData.table.slice(1).map((row) => row.slice(firstResultCol, lastResultCol + 1));
+      snapshot.states.forEach((state) => {
+        const row = results[state.slot.row - 2];
+        const memberLabels = state.members.map((member) => {
+          const name = String(member.name || '').trim();
+          return name === '' ? String(member.key) : `${member.key}: ${name}`;
+        });
+        row[slotData.availableMembersCol - firstResultCol] = memberLabels.length > 0 ? memberLabels.join(', ') : 'なし';
+        row[slotData.availableRoomsCol - firstResultCol] = state.rooms.length;
+        row[slotData.remainingCol - firstResultCol] = state.remaining;
+        row[slotData.allocatedCol - firstResultCol] = state.allocated;
+      });
+      sheets.getSheetByName('空き予定').getRange(2, firstResultCol + 1, results.length, lastResultCol - firstResultCol + 1).setValues(results);
+    }
+    __applyMemberAssignmentCounts(snapshot.context);
+    form.modify(snapshot);
+  }
+
+  function __addBookingToContext(context, row, allocation, eventId) {
+    if (!allocation.valid) {
+      return;
+    }
+    const item = {
+      row: row,
+      from: allocation.slot.from,
+      to: allocation.slot.to,
+      assistant: allocation.member.key,
+      room: allocation.room,
+      eventId: eventId,
+    };
+    context.activeBookings.push(item);
+    context.assignmentsByMember[item.assistant] = (context.assignmentsByMember[item.assistant] || 0) + 1;
+  }
+
+  function __writeAssignment(row, values) {
+    const sh = sheets.sheets[0];
+    Object.keys(values).forEach((configKey) => {
+      sh.getRange(row, settings.config[configKey] + 1).setValue(values[configKey]);
+    });
+  }
+
+  function __eventTitle(prefix, name) {
+    return `${prefix}: ${name}`;
+  }
+
+  return {
+    slots: function () {
+      return __getSlots().slots;
+    },
+
+    loadAvailabilityContext: function (options) {
+      return __loadAvailabilityContext(options);
+    },
+
+    calculateAvailabilitySnapshot: function (context) {
+      return __calculateAvailabilitySnapshot(context);
+    },
+
+    buildSnapshot: function (options) {
+      return __calculateAvailabilitySnapshot(__loadAvailabilityContext(options));
+    },
+
+    applySnapshot: function (snapshot) {
+      __applyAvailabilitySnapshot(snapshot);
+    },
+
+    assertMigrationIsSafe: function () {
+      __assertMigrationIsSafe();
+    },
+
+    migrateLegacySlots: function () {
+      __migrateLegacySlots();
+    },
+
+    prepareTentative: function (values) {
+      const requested = parseType3Slot(values[settings.config.colExpDate]);
+      const context = __loadAvailabilityContext();
+      const snapshot = __calculateAvailabilitySnapshot(context);
+      const state = requested === undefined ? undefined : snapshot.states.find((candidate) => candidate.slot.label === type3SlotLabel(requested.from, requested.to));
+      const slot = state === undefined ? undefined : state.slot;
+      if (slot === undefined || !slot.accepting) {
+        return { valid: false, trigger: '重複', context: context };
+      }
+      if (state.remaining < 1) {
+        return { valid: false, trigger: '重複', context: context };
+      }
+      return { valid: true, trigger: '仮予約', slot: slot, member: state.members[0], room: state.rooms[0], context: context };
+    },
+
+    commitTentative: function (row, values, allocation) {
+      if (!allocation.valid) {
+        sheets.sheets[0].getRange(row, settings.config.colStatus + 1, 1, 4).setValues([[allocation.trigger, 1, 'N/A', 'N/A']]);
+        __writeAssignment(row, { colAssignmentStatus: '解放' });
+        __applyAvailabilitySnapshot(__calculateAvailabilitySnapshot(allocation.context));
+        return;
+      }
+      const calendar = __calendarFor(allocation.member);
+      const event = calendar.createEvent(__eventTitle('仮予約', values[settings.config.colParName]), allocation.slot.from, allocation.slot.to, { location: allocation.room });
+      try {
+        sheets.sheets[0].getRange(row, settings.config.colStatus + 1, 1, 4).setValues([['', '', '', '']]);
+        __writeAssignment(row, {
+          colAssistant: allocation.member.key,
+          colRoom: allocation.room,
+          colAssignmentStatus: '仮割当',
+          colCalendarEventId: event.getId(),
+        });
+      } catch (err) {
+        event.deleteEvent();
+        throw err;
+      }
+      __addBookingToContext(allocation.context, row, allocation, event.getId());
+      __applyAvailabilitySnapshot(__calculateAvailabilitySnapshot(allocation.context));
+    },
+
+    finalize: function (row, values) {
+      if (String(values[settings.config.colAssignmentStatus]) !== '仮割当') {
+        throw new Error('最終確認できるのは「仮割当」状態の予約だけです。新しい pair の再割当は行いません。');
+      }
+      const member = settings.memberByKey(values[settings.config.colAssistant]);
+      const eventId = String(values[settings.config.colCalendarEventId] || '');
+      if (member === undefined || eventId === '') {
+        throw new Error('仮割当の実験者または CalendarEventId がありません。予約を確認してください。');
+      }
+      const event = __calendarFor(member).getEventById(eventId);
+      if (event === null) {
+        throw new Error('仮予約のカレンダーイベントが見つかりません。重複を避けるため自動再作成は行いません。');
+      }
+      event.setTitle(__eventTitle('予約完了', values[settings.config.colParName]));
+      event.setLocation(values[settings.config.colRoom]);
+      __writeAssignment(row, { colAssignmentStatus: '確定' });
+    },
+
+    release: function (row, values) {
+      if (!ACTIVE_STATES.has(String(values[settings.config.colAssignmentStatus]))) {
+        return '';
+      }
+      const member = settings.memberByKey(values[settings.config.colAssistant]);
+      const eventId = String(values[settings.config.colCalendarEventId] || '');
+      if (member !== undefined && eventId !== '') {
+        const event = __calendarFor(member).getEventById(eventId);
+        if (event !== null) {
+          event.deleteEvent();
+        }
+      }
+      __writeAssignment(row, { colAssignmentStatus: '解放' });
+      return eventId;
     },
   };
 })();
@@ -1220,6 +2059,7 @@ settings.default = (function () {
       ['実験開始可能時刻', 'openTime', 9],
       ['実験終了時刻', 'closeTime', 19],
       ['参照するカレンダー', 'workingCalendar', Session.getActiveUser().getEmail()],
+      ['実験室数 (1-5)', 'numberOfRooms', 1],
       ['実験開始日', 'openDate', Utilities.formatDate(new Date(), default_timezone, 'yyyy/MM/dd')],
       ['実験最終日', 'closeDate', Utilities.formatDate(close_date, default_timezone, 'yyyy/MM/dd')],
       ['リマインダー送信時刻', 'remindHour', 19],
@@ -1246,6 +2086,7 @@ settings.default = (function () {
       ['何時から実験できるかを記入してください（24時間表記）'], // 実験開始時刻
       ['何時まで実験可能かを記入してください（24時間表記）'], // 実験終了時刻
       ['利用したいカレンダーのIDをコピペしてください'], // 参照するカレンダー
+      ['TYPE 3 のみ使用します。1-5 の整数を入力すると Room 1...Room N が自動生成されます。'], // 実験室数
       ['実験を開始する日付を記入してください（年/月/日で表記）'], // 実験開始日
       ['実験の終了予定日を記入してください（年/月/日で表記）'], // 実験最終日
       ['リマインダーを送信する時刻を記入してください（24時間表記）。実験終了時刻以後にして下さい。なお指定した時刻から1時間以内に送信されます。'], // リマインダー送信時刻
@@ -1388,35 +2229,46 @@ settings.default = (function () {
 
     // メンバー
     const sh_name_answers = __sheet_answers.getName();
-    const last_column = __sheet_answers.getLastColumn();
-    const last_col_notation = __sheet_answers.getRange(1, last_column).getA1Notation().replace(/\d/, ''); // 列のアルファベットを取得
-    const formula = `=COUNTIF('${sh_name_answers}'!${last_col_notation}:${last_col_notation}, A2)`;
+    const answerHeaders = __sheet_answers.getRange(1, 1, 1, __sheet_answers.getLastColumn()).getValues()[0];
+    const assistantColumn = getHeaderIndex(answerHeaders, '担当') + 1;
+    const assistantColNotation = __sheet_answers.getRange(1, assistantColumn).getA1Notation().replace(/\d/, '');
+    const formula = `=COUNTIF('${sh_name_answers}'!${assistantColNotation}:${assistantColNotation}, A2)`;
     __default.members = [
-      ['キー', '名前', 'アドレス', '担当回数'],
-      [1, 'りんご', 'apple@hogege.com', formula],
-      [2, 'ごりら', 'gorilla@hogege.com', ''],
-      [3, 'らっぱ', 'horn@hogege.com', ''],
+      ['キー', '名前', 'アドレス', 'カレンダーID', '有効', '担当回数'],
+      [1, 'りんご', 'apple@hogege.com', Session.getActiveUser().getEmail(), 1, formula],
+      [2, 'ごりら', 'gorilla@hogege.com', '', 0, ''],
+      [3, 'らっぱ', 'horn@hogege.com', '', 0, ''],
     ];
 
     // 空き予定
-    __default.available = [];
+    __default.available = [['日付', '開始', '終了', '担当候補', '受付可', '空き実験者（参考）', '空き実験室数', '残り枠', '割当済み']];
     for (const now = new Date(); now <= close_date; now.setDate(now.getDate() + 1)) {
-      const new_row = [];
-      new_row.push(Utilities.formatDate(now, default_timezone, 'yyyy/MM/dd'));
       now.setHours(9, 0, 0);
       const close_time = 19;
       const exp_length = 60;
       for (const cur_time = new Date(now); cur_time.getHours() < close_time; cur_time.setMinutes(cur_time.getMinutes() + exp_length)) {
-        new_row.push(Utilities.formatDate(cur_time, default_timezone, 'HH:mm'));
+        const end_time = new Date(cur_time);
+        end_time.setMinutes(end_time.getMinutes() + exp_length);
+        __default.available.push([
+          Utilities.formatDate(cur_time, default_timezone, 'yyyy/MM/dd'),
+          Utilities.formatDate(cur_time, default_timezone, 'HH:mm'),
+          Utilities.formatDate(end_time, default_timezone, 'HH:mm'),
+          '',
+          1,
+          '',
+          '',
+        ]);
       }
-      __default.available.push(new_row);
     }
   }
 
   function __addNewColNames() {
     const current_colnms = __sheet_answers.getRange(1, 1, 1, __sheet_answers.getLastColumn()).getValues()[0];
     const new_colnms = ['予約ステータス', '連絡したか', 'リマインド日時', 'リマインドしたか', '担当'];
-    const colnms = current_colnms.concat(new_colnms);
+    if (TYPE == 3) {
+      new_colnms.push('実験室', '割当状態', 'CalendarEventId');
+    }
+    const colnms = current_colnms.concat(new_colnms.filter((header) => !current_colnms.includes(header)));
     __sheet_answers.getRange(1, 1, 1, colnms.length).setValues([colnms]);
   }
 
@@ -1443,11 +2295,26 @@ settings.default = (function () {
       ['担当の列', 'colAssistant', numToColumnNotation(last_column)],
     ];
 
+    const extra_config_type3 = [
+      ['参加者アドレスの列', 'colAddress', numToColumnNotation(last_column - 9)],
+      ['希望日時の列', 'colExpDate', numToColumnNotation(last_column - 8)],
+      ['予約ステータスの列', 'colStatus', numToColumnNotation(last_column - 7)],
+      ['「連絡したか」の列', 'colMailed', numToColumnNotation(last_column - 6)],
+      ['リマインド日時の列', 'colRemindDate', numToColumnNotation(last_column - 5)],
+      ['「リマインドしたか」の列', 'colReminded', numToColumnNotation(last_column - 4)],
+      ['担当の列', 'colAssistant', numToColumnNotation(last_column - 3)],
+      ['実験室の列', 'colRoom', numToColumnNotation(last_column - 2)],
+      ['割当状態の列', 'colAssignmentStatus', numToColumnNotation(last_column - 1)],
+      ['CalendarEventId の列', 'colCalendarEventId', numToColumnNotation(last_column)],
+    ];
+
     let extra_config;
-    if (TYPE == 1 || TYPE == 3) {
+    if (TYPE == 1) {
       extra_config = extra_config_type1.concat(extra_config_common);
     } else if (TYPE == 2) {
       extra_config = extra_config_type2.concat(extra_config_common);
+    } else if (TYPE == 3) {
+      extra_config = extra_config_type3;
     }
 
     __default.config.push(...extra_config);
@@ -1511,17 +2378,20 @@ settings.default = (function () {
             sheets.ss.deleteSheet(sh);
           }
         });
-      } else {
-        // フォームの回答に新しい列を追加する
-        __addNewColNames();
       }
+      // フォームの回答に不足している管理列だけを追加する
+      __addNewColNames();
       __createDefault();
       __createConfig();
       __createMailTemplate();
       __createMembers();
       if (TYPE == 3) {
         __createAvailable();
-        SpreadsheetApp.getUi().createMenu('カレンダー').addItem('カレンダーをシートに反映', 'updateFormAndSchedule').addToUi();
+        SpreadsheetApp.getUi()
+          .createMenu('カレンダー')
+          .addItem('空き予定とフォームを更新', 'updateFormAndSchedule')
+          .addItem('旧形式を複数人共同募集形式へ移行', 'migrateType3MultiResourceSchema')
+          .addToUi();
       }
       sheets.ss.insertSheet('Cached');
       sheets.update();
