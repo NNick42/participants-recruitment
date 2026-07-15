@@ -517,7 +517,7 @@ const sheets = (function () {
 
     getSheetByName: function (name) {
       if (__name_idx.get(name) === undefined) {
-        new Error(`「${name}」シートがありません。`);
+        throw new Error(`「${name}」シートがありません。`);
       }
       return __sheets[__name_idx.get(name)];
     },
@@ -677,17 +677,40 @@ const settings = (function () {
     }
   }
 
+  function __getOrCreateCacheSheet() {
+    let sh = sheets.ss.getSheetByName('Cached');
+    if (sh === null) {
+      sh = sheets.ss.insertSheet('Cached');
+      sheets.update();
+    }
+    return sh;
+  }
+
   function __retrieve() {
-    const sh = sheets.getSheetByName('Cached');
-    const cache_json = sh.getRange(1, 1).getValue();
+    const sh = __getOrCreateCacheSheet();
+    const cache_json = String(sh.getRange(1, 1).getValue() || '');
     if (cache_json.length < 10) {
       // cache用JSONが存在しない（適切ではない）場合
       for (let sheetName of __name_to_key.keys()) {
         __collect(sheetName);
       }
+      sh.getRange(1, 1).setValue(JSON.stringify(__settings));
     } else {
-      __settings = JSON.parse(cache_json);
-      __arrangeExpPeriod();
+      try {
+        const cachedSettings = JSON.parse(cache_json);
+        if (cachedSettings === null || typeof cachedSettings !== 'object' || cachedSettings.config === undefined) {
+          throw new Error('Cached の内容が設定データではありません。');
+        }
+        __settings = cachedSettings;
+        __arrangeExpPeriod();
+      } catch (err) {
+        console.warn(`Cached を再構築します: ${err.message}`);
+        __settings = {};
+        for (let sheetName of __name_to_key.keys()) {
+          __collect(sheetName, true);
+        }
+        sh.getRange(1, 1).setValue(JSON.stringify(__settings));
+      }
     }
   }
 
@@ -786,7 +809,7 @@ const settings = (function () {
     },
 
     save: function () {
-      const sh = sheets.getSheetByName('Cached');
+      const sh = __getOrCreateCacheSheet();
       sh.getRange(1, 1).setValue(JSON.stringify(__settings));
     },
 
@@ -2257,6 +2280,8 @@ settings.default = (function () {
           1,
           '',
           '',
+          '',
+          '',
         ]);
       }
     }
@@ -2367,6 +2392,10 @@ settings.default = (function () {
     // 空き予定シートの設定
     sheets.ss.insertSheet('空き予定');
     const sh = sheets.ss.getSheetByName('空き予定');
+    const width = __default.available[0].length;
+    if (__default.available.some((row) => row.length !== width)) {
+      throw new Error('「空き予定」の初期データで列数が一致していません。');
+    }
     sh.getRange(1, 1, __default.available.length, __default.available[0].length).setValues(__default.available);
   }
 
