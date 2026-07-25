@@ -2,9 +2,9 @@
 
 - An easy way of recruiting participants.
 - Forked from grocio/participants-recruitment-jp & snishiyama/participants-recruitment-jp.
+- Adding support for multi experimenters and rooms by NN.
 
 - v0.9.1 for test.
-- Support for multi experimenters and rooms by NN.
 - Support for multi experimenters (using their own Google Calendar) up to five and experiment rooms up to five.
 
 - [Change Log](#change-log)
