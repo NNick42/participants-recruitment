@@ -6,6 +6,7 @@
 
 - v0.9.1 for test.
 - Support for multi experimenters (using their own Google Calendar) up to five and experiment rooms up to five.
+- Time alignment (per update of the schedule) needs to be revised.
 
 - [Change Log](#change-log)
 - [導入](#導入)
